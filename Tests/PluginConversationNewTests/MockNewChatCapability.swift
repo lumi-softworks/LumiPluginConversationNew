@@ -1,0 +1,75 @@
+import Foundation
+@testable import PluginConversationNew
+
+/// 测试用会话能力替身。
+///
+/// 记录调用序列，用于断言「创建对话后立刻恢复选中态」这一关键不变量。
+@MainActor
+final class MockNewChatCapability: NewChatCapability {
+    private(set) var selectedID: UUID?
+    private(set) var createdConversations: [(title: String?, projectPath: String?, modelID: String?)] = []
+    private(set) var restoredSelections: [UUID?] = []
+    private(set) var selections: [UUID] = []
+    var modelID: String?
+    var projectPath: String?
+    /// 按对话 ID 注册的项目/模型归属，用于模拟「发起调用的对话」与 UI 选中对话不同（#331）。
+    var bindings: [UUID: (projectPath: String?, modelID: String?)] = [:]
+    /// 下一次创建时抛出的错误；nil 表示成功。
+    var createError: Error?
+    /// 视为仍存在于列表的对话 ID；用于模拟目标已被删除（#185）。
+    var existingConversationIDs: Set<UUID> = []
+    /// 首条用户消息已发出的对话 ID；用于模拟卡片重建/重启后的幂等判定（#632、#592）。
+    var consumedStarterIDs: Set<UUID> = []
+    /// 回答消费判定前执行的副作用；用于构造「等待期间目标被删除」的晚到场景。
+    var beforeConsumptionAnswer: (@MainActor (UUID) async -> Void)?
+
+    var selectedConversationID: UUID? { selectedID }
+    var currentModelID: String? { modelID }
+    var currentProjectPath: String? { projectPath }
+
+    func projectPath(for conversationID: UUID?) -> String? {
+        guard let conversationID else { return nil }
+        return bindings[conversationID]?.projectPath
+    }
+
+    func modelID(for conversationID: UUID?) -> String? {
+        guard let conversationID else { return nil }
+        return bindings[conversationID]?.modelID
+    }
+
+    func createTopLevelConversation(
+        title: String?,
+        projectPath: String?,
+        modelID: String?
+    ) async throws -> UUID {
+        createdConversations.append((title, projectPath, modelID))
+        if let createError { throw createError }
+        let id = UUID()
+        // 复刻内核行为：顶层对话创建后自动成为选中态。
+        selectedID = id
+        return id
+    }
+
+    func selectConversation(id: UUID) {
+        selections.append(id)
+        selectedID = id
+    }
+
+    func conversationExists(id: UUID) -> Bool {
+        existingConversationIDs.contains(id)
+    }
+
+    func restoreSelection(to conversationID: UUID?) {
+        restoredSelections.append(conversationID)
+        selectedID = conversationID
+    }
+
+    func deselectConversation() {
+        selectedID = nil
+    }
+
+    func starterAlreadySent(in conversationID: UUID) async -> Bool {
+        await beforeConsumptionAnswer?(conversationID)
+        return consumedStarterIDs.contains(conversationID)
+    }
+}

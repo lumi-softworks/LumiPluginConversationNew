@@ -1,0 +1,147 @@
+import Foundation
+import ProviderConversation
+import ProviderMessage
+
+/// 新建会话所需的最小会话管理能力。
+///
+/// 收窄 `ConversationManaging`，聚合本插件三处消费点：
+/// - 工具栏「新建会话」按钮：取消选择当前会话；
+/// - `create_new_conversation` 工具：创建顶层对话并恢复原选中态；
+/// - 建议卡片按钮：切换到指定对话。
+@MainActor
+protocol NewChatCapability: AnyObject {
+    /// 取消当前会话选择（会话面板会按需展示新建会话入口）。
+    func deselectConversation()
+
+    /// 当前选中的对话 ID；nil 表示尚未创建任何对话。
+    var selectedConversationID: UUID? { get }
+
+    /// 当前选中对话绑定的全局唯一模型 ID。
+    var currentModelID: String? { get }
+
+    /// 当前选中对话绑定的项目路径。
+    var currentProjectPath: String? { get }
+
+    /// 指定对话绑定的项目路径；nil 表示无此对话或未绑定项目。
+    ///
+    /// 用于按「发起工具调用的对话」而非 UI 当前选中对话解析归属（#331）。
+    func projectPath(for conversationID: UUID?) -> String?
+
+    /// 指定对话绑定的模型 ID；nil 表示无此对话或未绑定模型。
+    func modelID(for conversationID: UUID?) -> String?
+
+    /// 创建一个顶层对话（会进入侧边栏列表）。
+    ///
+    /// 等待持久化完成：落库失败会抛错，调用方必须把失败如实反馈给用户，
+    /// 不能显示「已准备成功」。
+    func createTopLevelConversation(
+        title: String?,
+        projectPath: String?,
+        modelID: String?
+    ) async throws -> UUID
+
+    /// 切换到指定对话。
+    func selectConversation(id: UUID)
+
+    /// 指定对话是否仍存在于会话列表。
+    ///
+    /// 建议卡片点击前必须据此校验目标：用户可能已删除工具创建的对话，
+    /// 向已删除 ID 切换/发送会启动不可见回合（#185）。
+    func conversationExists(id: UUID) -> Bool
+
+    /// 将选中态恢复为 `conversationID`；nil 表示恢复「未选中」（新建会话）态。
+    func restoreSelection(to conversationID: UUID?)
+
+    /// 指定对话的首条用户消息是否已经发出。
+    ///
+    /// 建议卡片的「已打开」不能只存在视图局部状态里：切换会话导致卡片重建、
+    /// 或应用重启后，局部状态回到 idle，再点一次就会重复发送首条消息并重复
+    /// 启动回合（#632、#592）。以消息存储为准可跨重建/重启保持幂等。
+    func starterAlreadySent(in conversationID: UUID) async -> Bool
+}
+
+/// 将 Kernel 的 ConversationManaging Provider 适配为插件能力。
+@MainActor
+final class NewChatCapabilityAdapter: NewChatCapability {
+    private weak var conversations: (any ConversationManaging)?
+    private weak var messages: (any MessageManaging)?
+
+    init(
+        conversations: (any ConversationManaging)?,
+        messages: (any MessageManaging)? = nil
+    ) {
+        self.conversations = conversations
+        self.messages = messages
+    }
+
+    func deselectConversation() {
+        conversations?.deselectConversation()
+    }
+
+    var selectedConversationID: UUID? { conversations?.selectedConversationID }
+
+    var currentModelID: String? { modelID(for: selectedConversationID) }
+
+    var currentProjectPath: String? { projectPath(for: selectedConversationID) }
+
+    func projectPath(for conversationID: UUID?) -> String? {
+        guard let id = conversationID else { return nil }
+        return conversations?.conversations.first { $0.id == id }?.projectPath
+    }
+
+    func modelID(for conversationID: UUID?) -> String? {
+        conversations?.modelID(for: conversationID)
+    }
+
+    /// 创建顶层对话：显式传 `parentConversationID: nil`。
+    ///
+    /// 不能改用子对话来规避选中态抢占——子对话不会进入侧边栏列表
+    /// （`fetchConversationPage(includingChildConversations: false)` 会过滤掉），
+    /// 用户点击后也找不到它。顶层对话在列表里可见，代价是会抢占
+    /// `selectedConversationID`，该行为由工具在同一调用内恢复
+    /// （见 `CreateNewConversationTool`）。
+    func createTopLevelConversation(
+        title: String?,
+        projectPath: String?,
+        modelID: String?
+    ) async throws -> UUID {
+        guard let conversations else {
+            throw NewChatCapabilityError.providerUnavailable
+        }
+        return try await conversations.createConversationAndWait(
+            title: title,
+            projectPath: projectPath,
+            modelID: modelID,
+            parentConversationID: nil
+        )
+    }
+
+    func selectConversation(id: UUID) {
+        conversations?.selectConversation(id: id)
+    }
+
+    func conversationExists(id: UUID) -> Bool {
+        conversations?.conversations.contains { $0.id == id } == true
+    }
+
+    func restoreSelection(to conversationID: UUID?) {
+        guard let conversationID else {
+            // nil 表示调用前处于「新建会话」未选中态：创建顶层对话会抢占选中态，
+            // 必须显式取消选择才能恢复空选中，而不是把用户甩进新建的空对话（#260）。
+            conversations?.deselectConversation()
+            return
+        }
+        conversations?.selectConversation(id: conversationID)
+    }
+
+    func starterAlreadySent(in conversationID: UUID) async -> Bool {
+        guard let messages else { return false }
+        return await messages.firstUserMessage(in: conversationID) != nil
+    }
+}
+
+/// 能力层在 Provider 缺失时的失败原因。
+enum NewChatCapabilityError: Error {
+    /// `ConversationManaging` 尚未注册。
+    case providerUnavailable
+}
